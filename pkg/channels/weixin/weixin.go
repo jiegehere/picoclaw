@@ -16,6 +16,14 @@ import (
 	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
+const (
+	// maxConsecutiveNoReply is the maximum number of consecutive bot messages without user reply.
+	// When reaching this limit (9th message), a reminder will be appended.
+	maxConsecutiveNoReply = 9
+	// noReplyReminder is the reminder message appended to the 9th consecutive message.
+	noReplyReminder = "\n\n⚠️ 注意：如果您不回复，我将无法继续主动发送消息。请回复任意内容以保持对话。"
+)
+
 // WeixinChannel is the Weixin channel implementation over Tencent iLink REST API.
 type WeixinChannel struct {
 	*channels.BaseChannel
@@ -33,6 +41,9 @@ type WeixinChannel struct {
 	pauseUntil        time.Time
 	syncBufPath       string
 	contextTokensPath string
+	// consecutiveNoReplyCounts tracks consecutive bot-sent messages without user reply per user.
+	// When count reaches 9, a reminder will be appended to the 10th message.
+	consecutiveNoReplyCounts sync.Map
 }
 
 func init() {
@@ -375,6 +386,9 @@ func (c *WeixinChannel) handleInboundMessage(ctx context.Context, msg WeixinMess
 		c.persistContextTokens()
 	}
 
+	// Reset consecutive no-reply counter when user sends a message
+	c.consecutiveNoReplyCounts.Delete(fromUserID)
+
 	inboundCtx := bus.InboundContext{
 		Channel:   "weixin",
 		ChatID:    fromUserID,
@@ -424,7 +438,19 @@ func (c *WeixinChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]st
 		return nil, fmt.Errorf("weixin send: %w: missing context token for chat %s", channels.ErrSendFailed, toUserID)
 	}
 
-	if err := c.sendTextMessage(ctx, toUserID, contextToken, msg.Content); err != nil {
+	// Check consecutive no-reply count and append reminder if needed
+	content := msg.Content
+	var count int64
+	if v, ok := c.consecutiveNoReplyCounts.Load(toUserID); ok {
+		count, _ = v.(int64)
+	}
+
+	// Append reminder on the 9th consecutive message
+	if count == maxConsecutiveNoReply-1 {
+		content += noReplyReminder
+	}
+
+	if err := c.sendTextMessage(ctx, toUserID, contextToken, content); err != nil {
 		logger.ErrorCF("weixin", "Failed to send message", map[string]any{
 			"to_user_id": toUserID,
 			"error":      err.Error(),
@@ -434,6 +460,9 @@ func (c *WeixinChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]st
 		}
 		return nil, fmt.Errorf("weixin send: %w", channels.ErrTemporary)
 	}
+
+	// Increment consecutive no-reply counter after successful send
+	c.consecutiveNoReplyCounts.Store(toUserID, count+1)
 
 	return nil, nil
 }
